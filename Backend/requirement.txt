@@ -1,4 +1,0 @@
-uvicorn[Standard]
-fastapi
-sqlalchemy
-PyJWT

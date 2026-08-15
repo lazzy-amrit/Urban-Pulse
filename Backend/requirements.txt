@@ -1,0 +1,8 @@
+fastapi[standard]
+passlib==1.7.4
+bcrypt==4.0.1
+sqlalchemy
+PyJWT
+slowapi
+python-dotenv
+sqlalchemy-libsql
