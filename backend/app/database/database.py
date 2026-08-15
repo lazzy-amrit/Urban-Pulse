@@ -16,13 +16,14 @@ engine = create_engine(
     poolclass=NullPool,
 )
 
-base = declarative_base()
+Base = declarative_base()
 
 LocalSession = sessionmaker(
     bind=engine,
     autocommit=False,
     autoflush=False,
 )
+
 
 def get_db():
     session = LocalSession()
