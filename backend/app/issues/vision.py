@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.database.models import RoadIssue
 from app.issues.clustering import find_nearby_issue
 from app.issues.confidence import calculate_final_confidence
+from app.issues.service import calculate_status
 
 logger = logging.getLogger("urban_pulse.issues")
 
@@ -46,6 +47,17 @@ def apply_vision_evidence(
 
     # Vision evidence can only reinforce, never lower, existing confidence.
     issue.confidence = max(issue.confidence, updated_confidence)
+
+    # Status still gates on report_count/unique_device_count from real sensor
+    # reports (see calculate_status), so vision alone can raise confidence
+    # without ever being able to confirm an issue by itself — but the status
+    # label must stay in sync with the confidence we just stored, or the map
+    # shows a stale tier next to an updated number.
+    new_status = calculate_status(issue.report_count, issue.unique_device_count, issue.confidence)
+    status_rank = {"likely": 0, "repeating": 1, "high_confidence": 2, "confirmed": 3}
+    if status_rank.get(new_status, 0) > status_rank.get(issue.status, 0):
+        issue.status = new_status
+
     db.commit()
     db.refresh(issue)
     return issue

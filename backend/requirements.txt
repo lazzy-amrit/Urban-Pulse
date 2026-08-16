@@ -8,3 +8,4 @@ PyJWT
 bcrypt
 httpx
 python-multipart
+google-genai

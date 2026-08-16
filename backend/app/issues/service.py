@@ -1,7 +1,10 @@
 """
-Core evidence-aggregation pipeline. This is where a validated sensor event
-turns into a RoadIssue creation/update: spatial matching -> AI interpretation
--> aggregation -> confidence/severity/status/classification -> persistence.
+Evidence-aggregation pipeline. ingest_sensor_event() is the fast synchronous
+path (spatial match, persist, aggregate) driven by a locally-computed
+interpretation — no network calls, so it's safe to run inline in the
+WebSocket loop. apply_ai_refinement() is called later, from a background
+task, once/if Gemini finishes; it recomputes the same issue with the
+better classification.
 """
 
 import json
@@ -24,7 +27,7 @@ from app.core.config import (
     STATUS_CONFIRMED_MIN_CONFIDENCE,
 )
 from app.database.models import RoadIssue, SensorReport, Device
-from app.intelligence.classifier import analyze_sensor_event
+from app.intelligence.ai_provider import AIInterpretation
 from app.issues.clustering import find_nearby_issue
 from app.issues.confidence import calculate_final_confidence, calculate_final_severity
 
@@ -36,48 +39,89 @@ def _next_issue_id(db: Session) -> str:
     return f"{ISSUE_ID_PREFIX}{str(count + 1).zfill(ISSUE_ID_PAD)}"
 
 
-def _calculate_status(report_count: int, unique_device_count: int, confidence: float) -> str:
+def get_prior_counts(db: Session, latitude: float, longitude: float) -> tuple[int, int]:
     """
-    Backend-owned status thresholds. Hackathon defaults, all named constants
-    in app/core/config.py — nothing scattered inline.
+    Report/unique-device counts for whatever issue already sits at this
+    location, if any. Used to build the *first-pass* fallback interpretation
+    with real evidence instead of always assuming a brand-new location —
+    otherwise repeat/independent-device signal never reaches the classifier
+    when Gemini is unavailable.
     """
+    issue = find_nearby_issue(db, latitude, longitude)
+    if issue is None:
+        return 0, 0
+    return issue.report_count, issue.unique_device_count
+
+
+def calculate_status(report_count: int, unique_device_count: int, confidence: float) -> str:
     if (
         report_count >= STATUS_CONFIRMED_MIN_REPORTS
         and unique_device_count >= STATUS_CONFIRMED_MIN_UNIQUE_DEVICES
         and confidence >= STATUS_CONFIRMED_MIN_CONFIDENCE
     ):
         return "confirmed"
-
     if (
         report_count >= STATUS_HIGH_CONFIDENCE_MIN_REPORTS
         and unique_device_count >= STATUS_HIGH_CONFIDENCE_MIN_UNIQUE_DEVICES
         and confidence >= STATUS_HIGH_CONFIDENCE_MIN_CONFIDENCE
     ):
         return "high_confidence"
-
     if report_count >= STATUS_REPEATING_MIN_REPORTS:
         return "repeating"
-
     return "likely"
 
 
 def _resolve_classification(current: str, ai_classification: str, status: str) -> str:
-    """
-    The AI proposes a classification per-event; the issue's overall
-    classification only strengthens toward a specific type (e.g.
-    pothole_likely) when the accumulated status actually supports it.
-    A single ambiguous read should not overwrite a previously well-evidenced
-    classification with "unknown".
-    """
     if ai_classification == "unknown":
         return current if current != "unknown" else "unknown"
-
-    if status in ("likely",):
-        # Not enough accumulated evidence yet — keep it generic unless we
-        # have nothing better.
-        return ai_classification if current == "unknown" else current or ai_classification
-
+    if status == "likely" and current != "unknown":
+        return current
     return ai_classification
+
+
+def _recompute_issue(
+    db: Session,
+    issue: RoadIssue,
+    phone_confidence: float | None,
+    phone_severity: float | None,
+    interpretation: AIInterpretation,
+    matched_within_radius: bool,
+    vision_evidence_present: bool,
+    timestamp: datetime,
+) -> None:
+    report_count = db.query(func.count(SensorReport.id)).filter(SensorReport.issue_id == issue.id).scalar() or 0
+    unique_device_count = (
+        db.query(func.count(func.distinct(SensorReport.device_id)))
+        .filter(SensorReport.issue_id == issue.id)
+        .scalar()
+        or 0
+    )
+
+    confidence = calculate_final_confidence(
+        phone_confidence=phone_confidence,
+        ai_confidence=interpretation.confidence,
+        report_count=report_count,
+        unique_device_count=unique_device_count,
+        matched_within_radius=matched_within_radius,
+        vision_evidence_present=vision_evidence_present,
+    )
+    severity = calculate_final_severity(
+        ai_severity=interpretation.severity,
+        phone_severity=phone_severity,
+        report_count=report_count,
+    )
+    status = calculate_status(report_count, unique_device_count, confidence)
+    classification = _resolve_classification(issue.classification, interpretation.classification, status)
+
+    issue.report_count = report_count
+    issue.unique_device_count = unique_device_count
+    issue.confidence = confidence
+    issue.severity = severity
+    issue.status = status
+    issue.classification = classification
+    issue.last_seen = timestamp
+    db.commit()
+    db.refresh(issue)
 
 
 def ingest_sensor_event(
@@ -93,34 +137,10 @@ def ingest_sensor_event(
     phone_severity: float | None,
     sensor_source: str | None,
     features: dict[str, Any] | None,
-    vision_evidence: list[dict[str, Any]] | None = None,
+    interpretation: AIInterpretation,
 ) -> tuple[SensorReport, RoadIssue]:
-    """
-    Full pipeline for one incoming sensor_event message. Returns the
-    persisted SensorReport and the RoadIssue it was attributed to.
-    """
-
-    # 1. Spatial matching against existing (non-resolved) issues.
     matched_issue = find_nearby_issue(db, latitude, longitude)
 
-    prior_report_count = matched_issue.report_count if matched_issue else 0
-    prior_unique_device_count = matched_issue.unique_device_count if matched_issue else 0
-
-    # 2. AI / rule-based interpretation of this specific event.
-    interpretation = analyze_sensor_event(
-        event_type=event_type,
-        phone_confidence=phone_confidence,
-        phone_severity=phone_severity,
-        sensor_source=sensor_source,
-        features=features,
-        speed=speed,
-        heading=heading,
-        prior_report_count=prior_report_count,
-        prior_unique_device_count=prior_unique_device_count,
-        vision_evidence=vision_evidence,
-    )
-
-    # 3. Persist the raw sensor report (evidence), linked once we know the issue id.
     report = SensorReport(
         device_id=device.id,
         timestamp=timestamp,
@@ -137,7 +157,6 @@ def ingest_sensor_event(
         ai_confidence=interpretation.confidence,
     )
 
-    # 4. Find-or-create the RoadIssue.
     if matched_issue is None:
         issue = RoadIssue(
             id=_next_issue_id(db),
@@ -153,7 +172,7 @@ def ingest_sensor_event(
             last_seen=timestamp,
         )
         db.add(issue)
-        db.flush()  # assign id before linking report
+        db.flush()
     else:
         issue = matched_issue
 
@@ -161,62 +180,54 @@ def ingest_sensor_event(
     db.add(report)
     db.flush()
 
-    # 5. Aggregate evidence: report_count and unique_device_count from actual rows,
-    #    so counts never drift from reality even under concurrent writes.
-    report_count = db.query(func.count(SensorReport.id)).filter(SensorReport.issue_id == issue.id).scalar() or 0
-    unique_device_count = (
-        db.query(func.count(func.distinct(SensorReport.device_id)))
-        .filter(SensorReport.issue_id == issue.id)
-        .scalar()
-        or 0
-    )
-
-    matched_within_radius = matched_issue is not None or report_count == 1
-
-    final_confidence = calculate_final_confidence(
+    _recompute_issue(
+        db,
+        issue,
         phone_confidence=phone_confidence,
-        ai_confidence=interpretation.confidence,
-        report_count=report_count,
-        unique_device_count=unique_device_count,
-        matched_within_radius=matched_within_radius,
-        vision_evidence_present=bool(vision_evidence),
-    )
-    final_severity = calculate_final_severity(
-        ai_severity=interpretation.severity,
         phone_severity=phone_severity,
-        report_count=report_count,
+        interpretation=interpretation,
+        matched_within_radius=True,
+        vision_evidence_present=False,
+        timestamp=timestamp,
     )
-    final_status = _calculate_status(report_count, unique_device_count, final_confidence)
-    final_classification = _resolve_classification(issue.classification, interpretation.classification, final_status)
-
-    issue.report_count = report_count
-    issue.unique_device_count = unique_device_count
-    issue.confidence = final_confidence
-    issue.severity = final_severity
-    issue.status = final_status
-    issue.classification = final_classification
-    issue.last_seen = timestamp
-
-    db.commit()
-    db.refresh(issue)
     db.refresh(report)
 
     logger.info(
-        "sensor event ingested: device=%s issue=%s status=%s confidence=%.2f",
-        device.id,
-        issue.id,
-        issue.status,
-        issue.confidence,
+        "event ingested: device=%s issue=%s status=%s confidence=%.2f",
+        device.id, issue.id, issue.status, issue.confidence,
     )
+    return report, issue
 
+
+def apply_ai_refinement(db: Session, report_id: str, interpretation: AIInterpretation) -> tuple[SensorReport, RoadIssue] | None:
+    report = db.query(SensorReport).filter(SensorReport.id == report_id).first()
+    if report is None or report.issue_id is None:
+        return None
+
+    issue = db.query(RoadIssue).filter(RoadIssue.id == report.issue_id).first()
+    if issue is None:
+        return None
+
+    report.ai_classification = interpretation.classification
+    report.ai_confidence = interpretation.confidence
+    db.commit()
+
+    _recompute_issue(
+        db,
+        issue,
+        phone_confidence=report.phone_confidence,
+        phone_severity=report.phone_severity,
+        interpretation=interpretation,
+        matched_within_radius=True,
+        vision_evidence_present=False,
+        timestamp=report.timestamp,
+    )
+    db.refresh(report)
+    logger.info("AI refinement applied: issue=%s status=%s confidence=%.2f", issue.id, issue.status, issue.confidence)
     return report, issue
 
 
 def list_issues_for_user(db: Session, user_id: str) -> list[RoadIssue]:
-    """
-    Issues relevant to the authenticated user's own devices (not the global
-    map — that's served over WS /api/v1/ws/map).
-    """
     return (
         db.query(RoadIssue)
         .join(SensorReport, SensorReport.issue_id == RoadIssue.id)

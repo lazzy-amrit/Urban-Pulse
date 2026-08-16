@@ -45,6 +45,8 @@ async def map_websocket(websocket: WebSocket, token: str | None = None):
                             severity=issue.severity,
                             report_count=issue.report_count,
                             unique_device_count=issue.unique_device_count,
+                            created_at=issue.created_at,
+                            updated_at=issue.updated_at,
                         ),
                     ).model_dump()
                 )

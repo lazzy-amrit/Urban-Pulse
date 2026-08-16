@@ -7,6 +7,7 @@ take down another connection or the server.
 import logging
 
 from fastapi import WebSocket
+from starlette.websockets import WebSocketState
 
 logger = logging.getLogger("urban_pulse.websocket")
 
@@ -44,6 +45,9 @@ class ConnectionManager:
     async def broadcast_to_map(self, message: dict) -> None:
         dead_sockets = []
         for socket in self.map_connections:
+            if socket.client_state != WebSocketState.CONNECTED:
+                dead_sockets.append(socket)
+                continue
             try:
                 await socket.send_json(message)
             except Exception as exc:  # noqa: BLE001 — one bad socket must not break the broadcast

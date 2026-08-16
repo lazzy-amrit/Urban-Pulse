@@ -1,26 +1,18 @@
 """
 Auth business logic: registration, login, profile updates, password change,
-and the password-reset (OTP) flow.
-
-Email delivery is isolated behind `send_otp_email()` so a real provider can
-be plugged in later via EMAIL_PROVIDER / EMAIL_API_KEY without touching the
-API contract or the rest of the auth flow.
+and the password-reset (OTP) flow. OTP delivery goes through Brevo
+(app/auth/email_brevo.py).
 """
 
 import logging
-import random
+import secrets
 from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
+from app.auth import email_brevo
 from app.auth.security import hash_password, verify_password, create_access_token
-from app.core.config import (
-    OTP_LENGTH,
-    OTP_EXPIRE_MINUTES,
-    OTP_MAX_ATTEMPTS,
-    EMAIL_PROVIDER,
-    EMAIL_API_KEY,
-)
+from app.core.config import OTP_LENGTH, OTP_EXPIRE_MINUTES, OTP_MAX_ATTEMPTS
 from app.core.errors import conflict, unauthorized, bad_request
 from app.database.models import User, PasswordResetOTP
 
@@ -88,25 +80,11 @@ def change_password(db: Session, user: User, current_password: str, new_password
 # ---------------------------------------------------------------------------
 
 def _generate_otp() -> str:
-    return "".join(str(random.randint(0, 9)) for _ in range(OTP_LENGTH))
+    return "".join(secrets.choice("0123456789") for _ in range(OTP_LENGTH))
 
 
 def send_otp_email(email: str, otp: str) -> None:
-    """
-    Isolated email delivery abstraction.
-
-    If no EMAIL_PROVIDER/EMAIL_API_KEY is configured, this is a no-op
-    (besides logging that delivery was skipped) so the rest of the
-    application keeps functioning in local/hackathon environments.
-    """
-    if not EMAIL_PROVIDER or not EMAIL_API_KEY:
-        logger.info("email provider not configured; skipping OTP email delivery")
-        return
-
-    # A real provider integration (e.g. Resend, SendGrid, Postmark) would be
-    # implemented here using EMAIL_PROVIDER / EMAIL_API_KEY. Kept isolated
-    # so it can be added without changing the public API contract.
-    logger.info("would send OTP email via provider=%s", EMAIL_PROVIDER)
+    email_brevo.send_otp_email(email, otp)
 
 
 def request_password_reset(db: Session, email: str) -> None:

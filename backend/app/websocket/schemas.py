@@ -98,6 +98,8 @@ class IssueBroadcastPayload(BaseModel):
     severity: float
     report_count: int
     unique_device_count: int
+    created_at: datetime
+    updated_at: datetime
 
 
 class IssueBroadcastMessage(BaseModel):
